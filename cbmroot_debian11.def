@@ -1,0 +1,258 @@
+Bootstrap: docker
+From: debian:11
+
+%labels
+    Author "Grigory Kozlov [g.kozlov@gsi.de]"
+    Description "Debian 11 + FairSoft/FairRoot/CBMROOT via autoinstall_framework.sh (config-driven)"
+    BuildDate "$(date -u +%Y-%m-%d)"
+
+%help
+    Build:
+      apptainer build cbmroot_debian11.sif cbmroot_debian11.def
+
+    Re-run inside writable sandbox:
+      apptainer shell --writable cbmroot_sandbox
+      source /opt/cbm/run_autoinstall.sh
+    or
+      apptainer exec --writable cbmroot_sandbox /opt/cbm/run_autoinstall.sh
+
+%files
+    cbm-container.conf /opt/cbm/config.env
+
+%environment
+    # Default values (can be overridden via /opt/cbm/config.env or SINGULARITYENV_* variables)
+    export INSTALL_BASE=${INSTALL_BASE:-/opt/cbm}
+    export CBMROOT_SRC=${CBMROOT_SRC:-$INSTALL_BASE/src/cbmroot}
+    export BUILD_JOBS=${BUILD_JOBS:-$(nproc)}
+    export AUTO_INSTALL=${AUTO_INSTALL:-yes}
+    # If AUTOINSTALL_FLAGS is set in ENV, it overrides the entire flag composition in the runner.
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+
+    # 1) Load configuration if present
+    if [ -f /opt/cbm/config.env ]; then
+        . /opt/cbm/config.env
+    fi
+
+    # 2) Apply defaults if not provided in config
+    INSTALL_BASE="${INSTALL_BASE:-/opt/cbm}"
+    CBMROOT_SRC="${CBMROOT_SRC:-${INSTALL_BASE}/src/cbmroot}"
+    BUILD_JOBS="${BUILD_JOBS:-$(nproc)}"
+    AUTO_INSTALL="${AUTO_INSTALL:-yes}"
+
+    # 3) Install dependencies (rsync is included for Pythia8 install step)
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates gnupg dirmngr \
+        build-essential cmake ninja-build \
+        git subversion curl wget pkg-config rsync \
+        python3 python3-dev python3-pip python3-venv \
+        gfortran clang \
+        bison flex gettext \
+        automake autoconf libtool libtool-bin \
+        lsb-release \
+        libssl-dev libxml2-dev libcurl4-openssl-dev \
+        libzstd-dev liblz4-dev zlib1g-dev \
+        libxxhash-dev \
+        libx11-dev libxpm-dev libxft-dev libxext-dev xorg-dev \
+        libglu1-mesa-dev freeglut3-dev libglew-dev \
+        libgsl-dev libfftw3-dev \
+        libtbb-dev libxerces-c-dev libyaml-cpp-dev \
+        libsqlite3-dev libncurses-dev libbz2-dev \
+        xutils-dev krb5-multidev \
+        unzip zip tar
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+    # 4) Create layout and clone CBMROOT sources
+    mkdir -p "${INSTALL_BASE}/src" /opt/cbm
+    chmod -R 777 "${INSTALL_BASE}" /opt/cbm || true
+
+    if [ ! -d "${CBMROOT_SRC}/.git" ]; then
+        if [ "${SPEC_CBMROOT_VER:-0}" = "1" ]; then
+            echo "[INFO] Cloning CBMROOT (full history for version selection) into: ${CBMROOT_SRC}"
+            git clone https://git.cbm.gsi.de/computing/cbmroot "${CBMROOT_SRC}"
+        else
+            echo "[INFO] Cloning CBMROOT (shallow) into: ${CBMROOT_SRC}"
+            git clone --depth 1 https://git.cbm.gsi.de/computing/cbmroot "${CBMROOT_SRC}"
+        fi
+    fi
+
+    # 5) Generate runner script (config-driven; applies version patching if SPEC_FSOFR_FROOT=1 with safeguards)
+    cat >/opt/cbm/run_autoinstall.sh <<'EOF_RUN'
+#!/usr/bin/env bash
+set -eu
+
+# Load config if available
+[ -f /opt/cbm/config.env ] && . /opt/cbm/config.env || true
+
+INSTALL_BASE="${INSTALL_BASE:-/opt/cbm}"
+CBMROOT_SRC="${CBMROOT_SRC:-${INSTALL_BASE}/src/cbmroot}"
+BUILD_JOBS="${BUILD_JOBS:-$(nproc)}"
+
+# Compose autoinstall flags from configuration
+FLAGS=""
+
+# Stack selection (-p/-d/-o). Skipped if SPEC_FSOFR_FROOT=1 (explicit versions injected).
+if [ "${SPEC_FSOFR_FROOT:-0}" != "1" ]; then
+  if [ "${USE_DEV:-0}" = "1" ]; then FLAGS="$FLAGS -d"
+  elif [ "${USE_OLD:-0}" = "1" ]; then FLAGS="$FLAGS -o"
+  else FLAGS="$FLAGS -p"
+  fi
+fi
+
+# Component selection
+[ "${INSTALL_FAIRSOFT:-1}" = "1" ] && FLAGS="$FLAGS -fs"
+[ "${INSTALL_FAIRROOT:-1}" = "1" ] && FLAGS="$FLAGS -fr"
+[ "${INSTALL_CBMROOT:-1}" = "1" ] && FLAGS="$FLAGS -cr"
+
+# Parallelism and automatic confirmation
+FLAGS="$FLAGS -y -nproc ${BUILD_JOBS}"
+
+# External installations (optional)
+if [ -n "${EXTERNAL_FAIRSOFT:-}" ]; then FLAGS="--use_fairsoft ${EXTERNAL_FAIRSOFT} $FLAGS"; fi
+if [ -n "${EXTERNAL_FAIRROOT:-}" ]; then FLAGS="--use_fairroot ${EXTERNAL_FAIRROOT} $FLAGS"; fi
+
+# Extra user-specified flags
+if [ -n "${EXTRA_FLAGS:-}" ]; then FLAGS="$FLAGS ${EXTRA_FLAGS}"; fi
+
+# Full manual override
+FLAGS="${AUTOINSTALL_FLAGS:-$FLAGS}"
+
+echo "=== autoinstall_framework.sh flags ==="
+echo "  $FLAGS"
+echo "======================================"
+
+LOG_DIR="/opt/cbm"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/install_$(date -u +%Y%m%d_%H%M%S).log"
+
+cd "${CBMROOT_SRC}"
+chmod +x autoinstall_framework.sh || true
+
+# Select CBMROOT version if requested via SPEC_CBMROOT_VER
+if [ "${SPEC_CBMROOT_VER:-0}" = "1" ]; then
+  : "${CBMROOT_VER:?CBMROOT_VER is required when SPEC_CBMROOT_VER=1}"
+
+  echo "[INFO] Selecting CBMROOT version from config: '${CBMROOT_VER}'"
+
+  # Handle shallow repositories by unshallowing + fetching tags
+  if git rev-parse --is-shallow-repository >/dev/null 2>&1 && git rev-parse --is-shallow-repository | grep -q true; then
+    echo "[INFO] Repository is shallow — running unshallow + fetch tags"
+    git fetch --unshallow --tags || git fetch --all --tags --prune
+  else
+    git fetch --all --tags --prune
+  fi
+
+  # Attempt checkout by tag/branch/commit
+  if git checkout -q "${CBMROOT_VER}" 2>/dev/null \
+     || git checkout -q "origin/${CBMROOT_VER}" 2>/dev/null \
+     || git checkout -q "tags/${CBMROOT_VER}" 2>/dev/null; then
+    :
+  else
+    echo "[WARN] Could not checkout '${CBMROOT_VER}'. Staying on default branch."
+  fi
+
+  echo "[INFO] CBMROOT now at: $(git rev-parse --short HEAD) [branch: $(git rev-parse --abbrev-ref HEAD)]"
+fi
+
+SCRIPT_TO_RUN="./autoinstall_framework.sh"
+PATCHED="./autoinstall_framework.custom.sh"
+
+# Patch setup_env_variables() if SPEC_FSOFR_FROOT=1
+if [ "${SPEC_FSOFR_FROOT:-0}" = "1" ]; then
+  : "${ROOTVER:?ROOTVER is required when SPEC_FSOFR_FROOT=1}"
+  : "${FSOFTVER:?FSOFTVER is required when SPEC_FSOFR_FROOT=1}"
+  : "${FROOTVER:?FROOTVER is required when SPEC_FSOFR_FROOT=1}"
+
+  # Normalize CRLF and patch setup_env_variables() by replacing its body
+  sed 's/\r$//' autoinstall_framework.sh | awk -v rootver="$ROOTVER" -v fsoftver="$FSOFTVER" -v frootver="$FROOTVER" '
+    function count_chars(s, ch,    n,i,c) { n=0; for (i=1; i<=length(s); i++) { c=substr(s,i,1); if (c==ch) n++ } return n }
+    BEGIN { mode="copy"; seen_header=0; injected=0; depth=0 }
+
+    # Detect function header: setup_env_variables()
+    mode=="copy" && $0 ~ /^[[:space:]]*setup_env_variables[[:space:]]*\(\)[[:space:]]*({)?[[:space:]]*$/ {
+      seen_header=1
+      if ($0 ~ /\{[[:space:]]*$/) {
+        mode="skip"; depth=1
+      } else {
+        mode="await_brace"
+      }
+      # Inject new function body
+      print "setup_env_variables() {"
+      print "  # Injected from /opt/cbm/config.env"
+      print "  export ROOTVER=" rootver
+      print "  export FSOFTVER=" fsoftver
+      print "  export FROOTVER=" frootver
+      print "  export CBMSRCDIR=`pwd`"
+      print "}"
+      injected=1
+      next
+    }
+
+    mode=="await_brace" {
+      if ($0 ~ /\{/) {
+        mode="skip"
+        depth += count_chars($0, "{"); depth -= count_chars($0, "}")
+        if (depth <= 0) { mode="copy" }
+      }
+      next
+    }
+
+    mode=="skip" {
+      depth += count_chars($0, "{"); depth -= count_chars($0, "}")
+      if (depth <= 0) { mode="copy" }
+      next
+    }
+
+    { print }
+  ' > "$PATCHED" || true
+
+  PATCH_OK=1
+  if ! grep -q "Injected from /opt/cbm/config.env" "$PATCHED" 2>/dev/null; then
+    echo "[WARN] setup_env_variables() patch marker not found; patch likely failed."
+    PATCH_OK=0
+  fi
+  if ! bash -n "$PATCHED" 2>/dev/null; then
+    echo "[WARN] Patched script failed bash syntax check."
+    PATCH_OK=0
+  fi
+  if ! grep -Eq '^[[:space:]]*setup_env_variables[[:space:]]*\(\)[[:space:]]*\{[[:space:]]*$|^[[:space:]]*setup_env_variables[[:space:]]*\(\)[[:space:]]*$' "$PATCHED"; then
+    echo "[WARN] Patched script lost setup_env_variables() definition."
+    PATCH_OK=0
+  fi
+
+  if [ "$PATCH_OK" -eq 1 ]; then
+    chmod +x "$PATCHED"
+    SCRIPT_TO_RUN="$PATCHED"
+    echo "[INFO] Using patched script: $SCRIPT_TO_RUN"
+  else
+    echo "[WARN] Falling back to original autoinstall_framework.sh (versions not injected)."
+    if ! echo " $FLAGS " | grep -Eq " -p | --pro | -d | --dev | -o | --old "; then
+      if [ "${USE_DEV:-0}" = "1" ]; then FLAGS="-d $FLAGS"
+      elif [ "${USE_OLD:-0}" = "1" ]; then FLAGS="-o $FLAGS"
+      else FLAGS="-p $FLAGS"
+      fi
+      echo "[INFO] Added stack selection flag to FLAGS for fallback: $FLAGS"
+    fi
+  fi
+fi
+
+"$SCRIPT_TO_RUN" ${FLAGS} 2>&1 | tee -a "${LOG_FILE}"
+
+EOF_RUN
+    chmod +x /opt/cbm/run_autoinstall.sh
+
+    # 6) Run installation during build if AUTO_INSTALL is enabled
+    if [ "${AUTO_INSTALL}" = "yes" ]; then
+        /bin/bash -lc '/opt/cbm/run_autoinstall.sh'
+    else
+        echo "[INFO] AUTO_INSTALL=no — skipped during build."
+    fi
+
+%runscript
+    echo "Container ready. To re-run installation with config: /opt/cbm/run_autoinstall.sh"
+    exec /bin/bash
+
